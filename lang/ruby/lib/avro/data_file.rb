@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require 'openssl'
+require 'zlib'
 
 module Avro
   module DataFile
@@ -24,19 +25,19 @@ module Avro
     SYNC_SIZE = 16
     SYNC_INTERVAL = 1000 * SYNC_SIZE
     META_SCHEMA = Schema.parse('{"type": "map", "values": "bytes"}')
-    VALID_CODECS = ['null']
+    VALID_CODECS = ['null', 'deflate']
     VALID_ENCODINGS = ['binary'] # not used yet
 
     class DataFileError < AvroError; end
 
-    def self.open(file_path, mode='r', schema=nil)
+    def self.open(file_path, mode='r', schema=nil, codec='null')
       schema = Avro::Schema.parse(schema) if schema
       case mode
       when 'w'
         unless schema
           raise DataFileError, "Writing an Avro file requires a schema."
         end
-        io = open_writer(File.open(file_path, 'wb'), schema)
+        io = open_writer(File.open(file_path, 'wb'), schema, codec)
       when 'r'
         io = open_reader(File.open(file_path, 'rb'), schema)
       else
@@ -51,9 +52,9 @@ module Avro
 
     class << self
       private
-      def open_writer(file, schema)
+      def open_writer(file, schema, codec='null')
         writer = Avro::IO::DatumWriter.new(schema)
-        Avro::DataFile::Writer.new(file, writer, schema)
+        Avro::DataFile::Writer.new(file, writer, schema, codec)
       end
 
       def open_reader(file, schema)
@@ -70,7 +71,7 @@ module Avro
       attr_reader :writer, :encoder, :datum_writer, :buffer_writer, :buffer_encoder, :sync_marker, :meta
       attr_accessor :block_count
 
-      def initialize(writer, datum_writer, writers_schema=nil)
+      def initialize(writer, datum_writer, writers_schema=nil, codec="null")
         # If writers_schema is not present, presume we're appending
         @writer = writer
         @encoder = IO::BinaryEncoder.new(@writer)
@@ -83,7 +84,7 @@ module Avro
 
         if writers_schema
           @sync_marker = Writer.generate_sync_marker
-          meta['avro.codec'] = 'null'
+          meta['avro.codec'] = codec
           meta['avro.schema'] = writers_schema.to_s
           datum_writer.writers_schema = writers_schema
           write_header
@@ -157,16 +158,28 @@ module Avro
         if block_count > 0
           # write number of items in block and block size in bytes
           encoder.write_long(block_count)
-          to_write = buffer_writer.string
-          encoder.write_long(to_write.size)
 
-          # write block contents
-          if meta['avro.codec'] == 'null'
-            writer.write(to_write)
+
+          # compress data
+          uncompressed_data = buffer_writer.string
+          case meta['avro.codec']
+          when 'null'
+            compressed_data = uncompressed_data 
+          when 'deflate'
+            compressed_data = Zlib::Deflate.deflate(uncompressed_data)
+            # The first two characters and last character are zlib
+            # wrappers around deflate data.
+            compressed_data = compressed_data.slice!(2, compressed_data.size-1)
           else
             msg = "#{meta['avro.codec'].inspect} coded is not supported"
             raise DataFileError, msg
           end
+
+          # write length of block
+          encoder.write_long(compressed_data.size)
+
+          # write block contents
+          writer.write(compressed_data)
 
           # write sync marker
           writer.write(sync_marker)
@@ -183,12 +196,13 @@ module Avro
     class Reader
       include ::Enumerable
 
-      attr_reader :reader, :decoder, :datum_reader, :sync_marker, :meta, :file_length
+      attr_reader :reader, :raw_decoder, :datum_decoder, :datum_reader, :sync_marker, :meta, :file_length
       attr_accessor :block_count
 
       def initialize(reader, datum_reader)
         @reader = reader
-        @decoder = IO::BinaryDecoder.new(reader)
+        @raw_decoder = IO::BinaryDecoder.new(reader)
+        @datum_decoder = nil
         @datum_reader = datum_reader
 
         # read the header: magic, meta, sync
@@ -220,7 +234,7 @@ module Avro
             end
           end
 
-          datum = datum_reader.read(decoder)
+          datum = datum_reader.read(datum_decoder)
           self.block_count -= 1
           yield(datum)
         end
@@ -250,14 +264,25 @@ module Avro
         # read metadata
         @meta = datum_reader.read_data(META_SCHEMA,
                                        META_SCHEMA,
-                                       decoder)
+                                       raw_decoder)
         # read sync marker
         @sync_marker = reader.read(SYNC_SIZE)
       end
 
       def read_block_header
-        self.block_count = decoder.read_long
-        decoder.read_long # not doing anything with length in bytes
+        self.block_count = raw_decoder.read_long
+        case meta['avro.codec']
+        when 'null'
+          raw_decoder.read_long # not doing anything with length in bytes
+          @datum_decoder = @raw_decoder
+        when 'deflate'
+          data = raw_decoder.read_bytes
+         # -15 is the log of the window size; negative indicates
+         # "raw" (no zlib headers) decompression.  See zlib.h.
+          zstream = Zlib::Inflate.new(-15)
+          uncompressed = zstream.inflate(data)
+          @datum_decoder = IO::BinaryDecoder.new(StringIO.new(uncompressed))
+        end
       end
 
       # read the length of the sync marker; if it matches the sync

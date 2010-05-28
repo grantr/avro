@@ -124,4 +124,57 @@ JSON
       assert_equal(block_count+1, dw.block_count)
     end
   end
+
+  def test_data_writer_deflate_codec
+    schema = <<-JSON
+{ "type": "record",
+  "name": "something",
+  "fields": [
+    {"name": "something_fixed", "type": {"name": "inner_fixed",
+                                         "type": "fixed", "size": 3}},
+    {"name": "something_enum", "type": {"name": "inner_enum",
+                                        "type": "enum",
+                                        "symbols": ["hello", "goodbye"]}},
+    {"name": "something_array", "type": {"type": "array", "items": "int"}},
+    {"name": "something_map", "type": {"type": "map", "values": "int"}},
+    {"name": "something_record", "type": {"name": "inner_record",
+                                          "type": "record",
+                                          "fields": [
+                                            {"name": "inner", "type": "int"}
+                                          ]}},
+    {"name": "username", "type": "string"}
+]}
+JSON
+
+    data = [{"username" => "john",
+              "something_fixed" => "foo",
+              "something_enum" => "hello",
+              "something_array" => [1,2,3],
+              "something_map" => {"a" => 1, "b" => 2},
+              "something_record" => {"inner" => 2},
+              "something_error" => {"code" => 403}
+            },
+            {"username" => "ryan",
+              "something_fixed" => "bar",
+              "something_enum" => "goodbye",
+              "something_array" => [1,2,3],
+              "something_map" => {"a" => 2, "b" => 6},
+              "something_record" => {"inner" => 1},
+              "something_error" => {"code" => 401}
+            }]
+
+    Avro::DataFile.open('data.avr', 'w', schema, 'deflate') do |dw|
+      data.each { |d| dw << d }
+    end
+
+    c = 0
+    Avro::DataFile.open('data.avr', 'r', schema) do |dw|
+      data.each_with_index do |d, i| 
+        c += 1
+        assert_equal(data[i], d)
+      end
+    end
+    assert_equal(2, c)
+
+  end
 end
