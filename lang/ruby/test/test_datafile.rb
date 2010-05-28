@@ -168,7 +168,7 @@ JSON
     end
 
     c = 0
-    Avro::DataFile.open('data.avr', 'r', schema) do |dw|
+    Avro::DataFile.open('data.avr', 'r') do |dw|
       data.each_with_index do |d, i| 
         c += 1
         assert_equal(data[i], d)
